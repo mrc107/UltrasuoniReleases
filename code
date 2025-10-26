@@ -1,0 +1,986 @@
+/***** CONFIG *****/
+const LABEL = 'ultrasuoni';
+const SHEET_NAME = 'Releases';
+const MAX_THREADS = 200;
+const RUN_EVERY_DAY_AT_HOUR = 9;
+
+const SCRAPE_FIRST_URL_FOR_DETAILS = true;   // fetch page to enrich title/date/price
+const AUTO_BACKFILL_WHEN_EMPTY = true;       // ignore "processed" on an empty sheet
+
+const MIN_LINK_COLS = 3;                     // minimum link columns
+const MAX_LINK_COLS = 20;                    // hard cap
+const RECORDS_PER_SHIPMENT = 20;             // batch size for shipping
+const REPLY_WINDOW_HOURS = 72;               // time-proximity fallback window
+
+// per-account destination storage key
+const USERPROP_SPREADSHEET_ID = 'TARGET_SPREADSHEET_ID';
+
+// Heuristics for interpreting your replies
+const BUY_KEYWORDS = [
+  'ok','okay','yes','yep','please order','order','preorder','pre-order',
+  'add','take','i’ll take',"i'll take",'confirm','confirmed',
+  'si','sì','ok grazie','prendo','lo prendo','me lo prendo','lo voglio',
+  'va bene','perfetto','confermo','mettilo da parte','tienimelo','ok per me','aggiungi','mi interessa'
+];
+const SKIP_KEYWORDS = [
+  'no','skip','pass','not this','not interested','maybe later','cancel',
+  'no grazie','non interessa','non ora','lascia stare','cancella'
+];
+
+/***** MAIN ENTRY *****/
+function scanLabelAndUpdateSheet() {
+  // In interactive runs this will prompt once to choose destination; in triggers it will use stored ID or throw a helpful error.
+  const sheet = getOrCreateSheet_(SHEET_NAME /* interactive by default */);
+  const props = PropertiesService.getScriptProperties();
+
+  const isEmptySheet = sheet.getLastRow() < 2;
+  const processedProp = props.getProperty('PROCESSED_MSG_IDS') || '';
+  const processed = new Set(
+    (AUTO_BACKFILL_WHEN_EMPTY && isEmptySheet) ? [] : processedProp.split(',').filter(Boolean)
+  );
+
+  const myAddrs = getMyAddresses_();
+
+  // 1) Normalize existing rows
+  const existing = readAndNormalizeExistingRows_(sheet);
+  let maxLinksSeen = existing.maxLinks;
+
+  // 2) Pull new messages (process per-thread to align releases with your replies)
+  const threads = GmailApp.search(`label:${LABEL}`, 0, MAX_THREADS);
+  const newRecs = [];
+  const newlyProcessed = [];
+
+  threads.forEach(thread => {
+    const messages = thread.getMessages();
+
+    // Split incoming (not me) vs my replies (me)
+    const incoming = [];
+    const myReplies = [];
+    messages.forEach(m => (isFromMe_(m, myAddrs) ? myReplies : incoming).push(m));
+
+    // Build reply signals (sorted by time)
+    const replySignals = myReplies
+      .sort((a,b) => a.getDate() - b.getDate())
+      .map(m => buildReplySignal_(m));
+
+    // Parse releases only from incoming messages
+    incoming.forEach(msg => {
+      const msgId = msg.getId();
+      if (processed.has(msgId)) return;
+
+      const rels = parseReleasesFromMessage_(msg);
+      if (!rels || !rels.length) { newlyProcessed.push(msgId); return; }
+
+      rels.forEach((rel, idx) => {
+        const detailUrl = getFirstDetailPageUrl_(rel.urls);
+
+        // maybe fix title from URL
+        if (looksWeakTitle_(rel.title) && detailUrl) {
+          const tFromUrl = deriveTitleFromUrl_(detailUrl);
+          if (tFromUrl) rel.title = tFromUrl;
+        }
+
+        // scrape if needed
+        let releaseDate = extractReleaseDate_(rel.segmentText);
+        let price       = extractPrice_(rel.segmentText);
+        if (detailUrl && (looksWeakTitle_(rel.title) || !releaseDate || !price)) {
+          const det = parsePageDetails_(detailUrl);
+          if (looksWeakTitle_(rel.title) && det.title) rel.title = det.title;
+          if (!releaseDate && det.date) releaseDate = det.date;
+          if (!price && det.price)      price = det.price;
+        }
+
+        // Match your replies to decide Confirmed / Qty (with time-proximity fallback)
+        const { decision, qty } = decideFromReplies_(rel, replySignals, { countInMsg: rels.length, index: idx });
+
+        maxLinksSeen = Math.max(maxLinksSeen, rel.urls.length);
+
+        const confirmed = (decision === 'buy') ? 'YES' : (decision === 'skip' ? 'NO' : '');
+        const q = (decision === 'buy') ? (qty || 1) : 0;
+
+        newRecs.push({
+          title: finalizeTitle_(rel.title) || '(untitled)',
+          urls: rel.urls.slice(0, MAX_LINK_COLS),
+          releaseDate: releaseDate || '',
+          price: price || '',
+          qty: q,
+          confirmed: confirmed,
+          emailDate: toIsoLocal_(rel.emailDate)
+        });
+      });
+
+      newlyProcessed.push(msgId);
+    });
+  });
+
+  // 3) Header & columns (with Shipping/Amount/Preso columns)
+  const requiredLinkCols = Math.min(MAX_LINK_COLS, Math.max(MIN_LINK_COLS, existing.maxLinks, maxLinksSeen));
+  ensureHeaderWithLinks_(sheet, requiredLinkCols);                 // Title | Links | Release Date | Price | Qty | Confirmed | Email Date | Shipping Date | Amount | Preso
+  const headerLen = 1 + requiredLinkCols + 8;
+  ensureMinColumns_(sheet, headerLen);
+
+  // 4) Write normalized + new
+  const shapedExisting = existing.rows.map(r => shapeRow_(r, requiredLinkCols));
+  const shapedNew      = newRecs.map(r => shapeRow_(r, requiredLinkCols));
+  const allRows        = shapedExisting.concat(shapedNew);
+
+  if (sheet.getLastRow() > 1) {
+    sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).clearContent();
+  }
+  if (allRows.length) {
+    sheet.getRange(2, 1, allRows.length, headerLen).setValues(allRows.map(r => padRight_(r, headerLen, '')));
+  }
+
+  // 5) Sort by Release Date, then compute Shipping/Amount and Preso marks
+  sortByReleaseDate_(sheet, requiredLinkCols);
+  computeShipmentForecast_(sheet, requiredLinkCols);
+
+  // 6) Persist processed IDs (reuse processedProp)
+  if (newlyProcessed.length) {
+    const next = new Set([...(processedProp.split(',').filter(Boolean)), ...newlyProcessed]);
+    props.setProperty('PROCESSED_MSG_IDS', [...next].join(','));
+  }
+}
+
+/***** FORECAST & "PRESO" *****/
+function sortByReleaseDate_(sheet, linkCols) {
+  const lastRow = sheet.getLastRow();
+  const lastCol = sheet.getLastColumn();
+  if (lastRow < 2) return;
+
+  const releaseDateCol = 1 + linkCols + 1; // after Title + Links
+  sheet.getRange(2, 1, lastRow - 1, lastCol).sort({ column: releaseDateCol, ascending: true });
+}
+
+function computeShipmentForecast_(sheet, linkCols) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return;
+
+  const releaseDateCol  = 1 + linkCols + 1;
+  const priceCol        = releaseDateCol + 1;
+  const qtyCol          = priceCol + 1;
+  const confirmedCol    = qtyCol + 1;
+  const emailDateCol    = confirmedCol + 1;
+  const shippingCol     = emailDateCol + 1;
+  const amountCol       = shippingCol + 1;
+  const presoCol        = amountCol + 1; // rightmost column
+
+  const numCols = presoCol;
+  ensureMinColumns_(sheet, numCols);
+
+  const dataRange = sheet.getRange(2, 1, lastRow - 1, numCols);
+  const data = dataRange.getValues();
+
+  // Compute and write "Preso" marks for ALL rows (x if Confirmed=YES and qty>0; blank qty counts as 1)
+  const presoOut = data.map(r => {
+    const conf = String(r[confirmedCol - 1] || '').toLowerCase().startsWith('y');
+    const qtyVal = parseInt(r[qtyCol - 1], 10);
+    const qty = conf ? (isNaN(qtyVal) || qtyVal <= 0 ? 1 : qtyVal) : Math.max(0, isNaN(qtyVal) ? 0 : qtyVal);
+    return [ (conf && qty > 0) ? 'x' : '' ];
+  });
+  sheet.getRange(2, presoCol, lastRow - 1, 1).setValues(presoOut);
+
+  // Clear old forecast (Shipping Date + Amount)
+  sheet.getRange(2, shippingCol, lastRow - 1, 2).clearContent();
+
+  // Build unit list from confirmed rows (replicate by qty; blank qty=1 if confirmed)
+  const units = [];
+  for (let i = 0; i < data.length; i++) {
+    const rdStr = String(data[i][releaseDateCol - 1] || '').trim();
+    const rd = parseDate_(rdStr);
+    if (!rd) continue;
+
+    const confirmed = String(data[i][confirmedCol - 1] || '').toLowerCase().startsWith('y');
+    const qRaw = parseInt(data[i][qtyCol - 1], 10);
+    const qty = confirmed ? (isNaN(qRaw) || qRaw <= 0 ? 1 : qRaw) : 0;
+    const price = parsePriceNumber_(String(data[i][priceCol - 1] || ''));
+
+    if (!confirmed || qty <= 0) continue;
+
+    for (let q = 0; q < qty; q++) {
+      units.push({ absRow: i + 2, d: rd, price });
+    }
+  }
+
+  // For every full batch of RECORDS_PER_SHIPMENT, write shipping date & amount on that unit's row
+  for (let i = 0; i + RECORDS_PER_SHIPMENT <= units.length; i += RECORDS_PER_SHIPMENT) {
+    const batch = units.slice(i, i + RECORDS_PER_SHIPMENT);
+    const last  = batch[batch.length - 1];
+    const sum   = batch.reduce((s, x) => s + (x.price || 0), 0);
+
+    sheet.getRange(last.absRow, shippingCol).setValue(toIsoDate_(last.d));
+    sheet.getRange(last.absRow, amountCol).setValue('€' + sum.toFixed(2));
+  }
+}
+
+/***** REPLY → DECISION (buy/skip/none) *****/
+function decideFromReplies_(release, replySignals, scope) {
+  let decision = 'none';
+  let qty = 0;
+
+  // First pass: strict matching (URL/ID/title tokens)
+  replySignals.forEach(sig => {
+    if (!replyMatchesRelease_(sig, release)) return;
+    const sentiment = sentimentOf_(sig.textLower);
+    if (sentiment === 'neg') { decision = 'skip'; qty = 0; }
+    else if (sentiment === 'pos') { decision = 'buy'; qty = sig.qty || 1; }
+  });
+
+  if (decision !== 'none') return { decision, qty };
+
+  // Time-proximity fallback: if exactly one release in that incoming message,
+  // and your next reply within REPLY_WINDOW_HOURS is positive, treat as buy.
+  const countInMsg = (scope && scope.countInMsg) || 0;
+  if (countInMsg === 1) {
+    const after = replySignals
+      .filter(sig => sig.date && sig.date > release.emailDate && sentimentOf_(sig.textLower) === 'pos')
+      .sort((a, b) => a.date - b.date);
+    if (after.length) {
+      const first = after[0];
+      if (hoursBetween_(first.date, release.emailDate) <= REPLY_WINDOW_HOURS) {
+        decision = 'buy';
+        qty = first.qty || 1;
+      }
+    }
+  }
+
+  return { decision, qty };
+}
+
+function replyMatchesRelease_(sig, release) {
+  // 1) URL intersection (best)
+  const relDetail = getFirstDetailPageUrl_(release.urls);
+  if (relDetail && sig.urlsSet.has(normalizeUrl_(relDetail))) return true;
+
+  // IDs in text (Hardwax/Clone)
+  if (relDetail) {
+    const idHw = (relDetail.match(/hardwax\.com\/(\d{4,6})\//i) || [])[1];
+    if (idHw && sig.textLower.includes(idHw)) return true;
+    const idClone = (relDetail.match(/clone\.nl\/item(\d+)\.html/i) || [])[1];
+    if (idClone && sig.textLower.includes(idClone)) return true;
+  }
+
+  // 2) Title tokens fallback
+  const toks = titleTokens_(release.title);
+  let hits = 0;
+  toks.forEach(tok => { if (sig.textLower.includes(tok)) hits++; });
+  return hits >= 2;
+}
+
+function buildReplySignal_(msg) {
+  const text = (msg.getPlainBody() || '').trim();
+  const textLower = text.toLowerCase();
+  const urls = extractUrls_(text).map(normalizeUrl_);
+  const urlsSet = new Set(urls);
+  const qty = parseQty_(textLower);
+  return { textLower, urls, urlsSet, qty, date: msg.getDate() };
+}
+
+function sentimentOf_(txt) {
+  const hasNeg = SKIP_KEYWORDS.some(k => txt.includes(k.toLowerCase()));
+  const hasPos = BUY_KEYWORDS.some(k => txt.includes(k.toLowerCase()));
+  if (hasNeg) return 'neg';
+  if (hasPos) return 'pos';
+  return 'neutral';
+}
+
+function parseQty_(txt) {
+  const patterns = [
+    /\b(\d{1,2})\s*x\b/i,          // 2x
+    /\bx\s*(\d{1,2})\b/i,          // x2
+    /\bqty\s*(\d{1,2})\b/i,        // qty 2
+    /\b(\d{1,2})\s*(copies|copy|pezzi|pz|copie)\b/i
+  ];
+  for (const rx of patterns) {
+    const m = txt.match(rx);
+    if (m) return Math.max(1, parseInt(m[1], 10) || 1);
+  }
+  return 0;
+}
+
+function titleTokens_(title) {
+  return (title || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9à-ÿ\s]/gi, ' ')
+    .split(/\s+/)
+    .filter(t => t.length >= 4 && !/^(remix|rmx|album|single|various|artist|records?)$/.test(t));
+}
+
+function normalizeUrl_(u) {
+  try {
+    const url = new URL(u);
+    url.hash = '';
+    if (url.hostname.endsWith('youtube.com') && url.searchParams.has('t')) {
+      url.searchParams.delete('t');
+    }
+    return url.toString();
+  } catch (e) { return u; }
+}
+
+function hoursBetween_(a, b) {
+  return Math.abs((a - b) / 36e5);
+}
+
+/***** MULTI-RELEASE PARSER *****/
+function parseReleasesFromMessage_(msg) {
+  let body = msg.getPlainBody() || '';
+  try {
+    const atts = msg.getAttachments({ includeAttachments: true, includeInlineImages: false }) || [];
+    atts.forEach(a => {
+      const name = (a.getName() || '').toLowerCase();
+      const ctype = (a.getContentType() || '').toLowerCase();
+      if (name.endsWith('.eml') || ctype.includes('message/rfc822')) {
+        body += '\n' + a.getDataAsString();
+      }
+    });
+  } catch (e) {}
+
+  const subject   = (msg.getSubject() || '').trim();
+  const emailDate = msg.getDate();
+  const from      = msg.getFrom();
+
+  // Primary: detect explicit title blocks
+  let blocks = detectReleaseBlocks_(body);
+
+  // Fallback: url-only releases
+  if (!blocks.length) {
+    const lines = (body || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+    const detailUrls = [];
+    lines.forEach(l => extractCandidateDetailUrls_(l).forEach(u => detailUrls.push(u)));
+    const seen = new Set();
+    blocks = detailUrls
+      .filter(u => { if (seen.has(u)) return false; seen.add(u); return true; })
+      .map(u => ({ title: deriveTitleFromUrl_(u) || '', text: u }));
+  }
+
+  if (!blocks.length) {
+    const fallbackTitle = extractTitleFromBodyOnly_(body) || extractTitle_(body, subject) || '';
+    const urls = extractUrls_(body);
+    const clean = Array.from(new Set(urls.map(u => u.replace(/[),.;]+$/g, ''))));
+    if (!fallbackTitle && !clean.length) return [];
+    return [{ title: fallbackTitle || '(untitled)', urls: clean, segmentText: body, emailDate, from, subject }];
+  }
+
+  const releases = [];
+  blocks.forEach(block => {
+    const urls = extractUrls_(block.text);
+    const cleanUrls = Array.from(new Set(urls.map(u => u replace(/[),.;]+$/g, ''))));
+    const detailUrls = extractCandidateDetailUrls_(block.text);
+
+    const title = sanitizeTitle_(block.title || '');
+    const generic = isGenericHeader_(title) || looksWeakTitle_(title);
+
+    if (generic && detailUrls.length > 1) {
+      detailUrls.forEach(u => {
+        const perUrls = cleanUrls.filter(x => x === u || /media\.hardwax\.com\/audio\//i.test(x));
+        releases.push({
+          title: deriveTitleFromUrl_(u) || '',
+          urls: perUrls.length ? perUrls : [u],
+          segmentText: [title, u].join('\n'),
+          emailDate, from, subject
+        });
+      });
+    } else {
+      releases.push({
+        title: title || (detailUrls[0] ? deriveTitleFromUrl_(detailUrls[0]) : ''),
+        urls: cleanUrls,
+        segmentText: block.text,
+        emailDate, from, subject
+      });
+    }
+  });
+
+  return releases.filter(r => r.title || (r.urls && r.urls.length));
+}
+
+/***** Title block detection *****/
+function detectReleaseBlocks_(body) {
+  const rawLines = (body || '').split(/\r?\n/).map(s => s.trim());
+  const lines = rawLines.filter(l => !!l && !/^using gmail with screen readers/i.test(l));
+
+  const titleIdxs = [];
+  for (let i = 0; i < lines.length; i++) if (isTitleLine_(lines[i])) titleIdxs.push(i);
+  if (!titleIdxs.length) return [];
+
+  const blocks = [];
+  for (let t = 0; t < titleIdxs.length; t++) {
+    const start = titleIdxs[t];
+    const end = (t + 1 < titleIdxs.length) ? titleIdxs[t + 1] : lines.length;
+    const title = sanitizeTitle_(lines[start]);
+    const text = [lines[start]].concat(lines.slice(start + 1, end)).join('\n');
+    if (extractUrls_(text).length) blocks.push({ title, text });
+  }
+  return blocks;
+}
+
+function isTitleLine_(l) {
+  if (!l) return false;
+  if (/^https?:\/\//i.test(l)) return false;
+  if (/^>{1,}/.test(l)) return false;
+  if (l.length < 5 || l.length > 180) return false;
+
+  if (/^(out now|out this week|pre[-\s]?order|preorder|ultima chiamata|last call|attn|disco raccomandato)/i.test(l)) return false;
+  if (/^vibrant period/i.test(l)) return false;
+
+  if (/\s[–-]\s/.test(l)) {
+    const m = l.split(/\s[–-]\s/);
+    const leftWords = m[0].trim().split(/\s+/).length;
+    const rightWords = m[1].trim().split(/\s+/).length;
+    if (leftWords <= 6 && rightWords <= 15) return true;
+  }
+  if (/\b(EP|LP|Album|Single|Remix|RMX|Compilation|Sampler|VA|12["”']|10["”']|7["”']|Cassette|Tape)\b/i.test(l)) return true;
+  if (/\s[–-]\s.*\[[^\]]+\]/.test(l)) return true;
+
+  return false;
+}
+
+function sanitizeTitle_(s) {
+  let t = (s || '')
+    .replace(/^(Re:|Fwd:)\s*/i, '')
+    .replace(/^[>*\s]+/, '')
+    .replace(/\*+/g, '')
+    .replace(/\s{2,}/g, ' ')
+    .replace(/\s[-–—]\s?(OUT NOW|OUT THIS WEEK|PRE[-\s]?ORDER).*$/i, '')
+    .replace(/\s?https?:\/\/.*$/i, '')
+    .trim();
+  if (looksWeakTitle_(t)) return '';
+  return t;
+}
+function isGenericHeader_(t) {
+  let s = String(t || '')
+    .replace(/^(Re:|Fwd:)\s*/i, '')
+    .replace(/^[>*\s]+/, '')
+    .replace(/\*+/g, '')
+    .trim()
+    .toLowerCase();
+
+  if (!s) return true;
+
+  const prefixes = [
+    'out now','out this week','pre-order','preorder','pre order',
+    'ultima chiamata','last call','attn','disco raccomandato',
+    'vibrant period','best record','preorder essential','preorder oggi',
+    'atn','attn'
+  ];
+  if (prefixes.some(p => s.startsWith(p))) return true;
+
+  if (/^https?:\/\//.test(s)) return true;
+  if (/^\W+$/.test(s)) return true;
+  if (s.length < 5) return true;
+
+  return false;
+}
+
+// Body-only (does NOT fall back to subject)
+function extractTitleFromBodyOnly_(body) {
+  const lines = (body || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+  const dash = lines.find(l => /\s[–-]\s/.test(l) && l.length <= 180 && !/^https?:\/\//i.test(l));
+  if (dash) return dash.replace(/\s{2,}/g, ' ');
+  const kw  = lines.find(l => /\b(EP|LP|Album|Single)\b/i.test(l) && l.length <= 180 && !/^https?:\/\//i.test(l));
+  if (kw) return kw.replace(/\s{2,}/g, ' ');
+  return '';
+}
+
+function extractTitle_(body, subject) {
+  const lines = (body || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+  const dashLine = lines.find(l => /.+\s[–-]\s.+/.test(l) && l.length <= 180 && !/^https?:\/\//i.test(l));
+  if (dashLine) return dashLine.replace(/\s{2,}/g, ' ');
+  const releaseKeyword = lines.find(l => /\b(EP|LP|Album|Single|Remix|RMX|Compilation|Sampler|VA)\b/i.test(l) && l.length <= 180 && !/^https?:\/\//i.test(l));
+  if (releaseKeyword) return releaseKeyword.replace(/\s{2,}/g, ' ');
+  const cleanedSubject = String(subject || '')
+    .replace(/^(Re:|Fwd:)\s*/i, '')
+    .replace(/\b(attn|ultima chiamata|last call|fwd)\b.*$/i, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+  return cleanedSubject || '';
+}
+
+/***** URL & SITE PREFERENCES *****/
+function extractUrls_(text) {
+  if (!text) return [];
+  let all = text.match(/https?:\/\/[^\s<>"')\]]+/g) || [];
+  all = all.map(u => u replace(/^<+|>+$/g, ''));
+
+  // drop helper/image URLs
+  all = all.filter(u => !/hardwax\.com\/basket/i.test(u));
+  all = all.filter(u => !/\.(?: jpe?g|png|gif)(?:\?|#|$)/i.test(u) === false); // keep only non-image
+  all = all.filter(u => !/\/wp-content\/uploads\//i.test(u));
+  all = all.filter(u => !/\/\/i\d+\.sndcdn\.com\//i.test(u));
+  all = all.filter(u => !/\/product_images\//i.test(u));
+
+  const preferred = [
+    'bandcamp.com','soundcloud.com','youtube.com','youtu.be',
+    'one-eye-witness.com','boomkat.com','juno.co.uk','clone.nl',
+    'clonedistribution.com','hardwax.com','media.hardwax.com',
+    'decks.de','spotify.com','music.apple.com'
+  ];
+
+  const seen = new Set();
+  return all.sort((a,b) => {
+    const pa = preferred.some(p => a.includes(p));
+    const pb = preferred.some(p => b.includes(p));
+    return (pb - pa);
+  }).filter(u => { if (seen.has(u)) return false; seen.add(u); return true; });
+}
+
+function extractCandidateDetailUrls_(text) {
+  const urls = extractUrls_(text);
+  return urls.filter(u => {
+    if (/media\.hardwax\.com\/audio\//i.test(u)) return false;
+    if (/hardwax\.com\/basket/i.test(u)) return false;
+    return /(hardwax\.com|clone\.nl|clonedistribution\.com|bandcamp\.com|one-eye-witness\.com|boomkat\.com|juno\.co\.uk|decks\.de)/i.test(u);
+  });
+}
+
+function isPreferredUrl_(u) {
+  return [
+    'hardwax.com','clone.nl','clonedistribution.com','bandcamp.com',
+    'one-eye-witness.com','boomkat.com','juno.co.uk','decks.de'
+  ].some(p => u.includes(p));
+}
+
+/***** TITLE FROM URL + PAGE SCRAPE *****/
+function looksWeakTitle_(t) {
+  if (!t) return true;
+  if (/https?:\/\//i.test(t)) return true;
+  if (/^>{1,}/.test(t)) return true;
+  if (/^\W+$/.test(t)) return true;
+  if (t.length < 5) return true;
+  return false;
+}
+
+function decodeSlug_(s) { try { return decodeURIComponent(s); } catch(e) { return s; } }
+function toTitleCaseSlug_(s) {
+  return s.replace(/[-_]+/g, ' ')
+          .split(' ')
+          .map(w => w ? w[0].toUpperCase() + w.slice(1) : w)
+          .join(' ')
+          .replace(/\s{2,}/g,' ')
+          .trim();
+}
+
+// Hardwax/Bandcamp title from URL
+function deriveTitleFromUrl_(url) {
+  try {
+    const u = new URL(url.replace(/^<|>$/g,''));
+    const host = u.hostname.toLowerCase();
+    const parts = u.pathname split('/').filter(Boolean).map(decodeSlug_);
+
+    // Hardwax: /<id>/<artist>/<release>/
+    if (host.includes('hardwax.com') && parts.length >= 3) {
+      const artist = toTitleCaseSlug_(parts[1]);
+      const rel    = toTitleCaseSlug_(parts[2]);
+      if (artist && rel) return `${artist} – ${rel}`;
+    }
+
+    // Bandcamp album: <artist>.bandcamp.com/album/<slug>
+    if (host.endsWith('bandcamp.com') && parts[0] === 'album' && parts[1]) {
+      const artist = toTitleCaseSlug_(host.replace('.bandcamp.com','').replace(/\./g,' '));
+      const rel    = toTitleCaseSlug_(parts[1]);
+      if (artist && rel) return `${artist} – ${rel}`;
+    }
+
+    return '';
+  } catch(e) {
+    return '';
+  }
+}
+
+function getFirstDetailPageUrl_(urls) {
+  const pageCandidates = (urls || []).filter(u => {
+    if (/media\.hardwax\.com\/audio\//i.test(u)) return false;
+    if (/hardwax\.com\/basket/i.test(u)) return false;
+    return /(hardwax\.com|clone\.nl|clonedistribution\.com|bandcamp\.com|one-eye-witness\.com|boomkat\.com|juno\.co\.uk|decks\.de)/i.test(u);
+  });
+  return pageCandidates[0] || null;
+}
+
+function parsePageDetails_(url) {
+  try {
+    const res = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+    if (res.getResponseCode() >= 400) return {};
+    const html = res.getContentText();
+
+    // Title: og:title -> <title>
+    let m = html.match(/<meta[^>]+property=["']og:title["'][^>]*content=["']([^"']+)["']/i);
+    let title = m ? m[1].trim() : '';
+    if (!title) {
+      m = html.match(/<title[^>]*>([^<]+)<\/title>/i);
+      if (m) title = m[1].trim();
+    }
+    title = stripSiteSuffix_(title, url);
+
+    // Price
+    let price = '';
+    m = html.match(/[€£$]\s*\d{1,4}(?:[.,]\d{2})?/);
+    if (m) price = m[0].replace(/\s{2,}/g, ' ').trim();
+    if (!price) {
+      m = html.match(/(?:itemprop|data-)?price["':\s=><]+([0-9]+(?:[.,][0-9]{2})?)/i);
+      if (m) price = m[1];
+    }
+
+    // Release date
+    const date = extractReleaseDate_(html);
+
+    return { title, price, date };
+  } catch (e) {
+    return {};
+  }
+}
+
+function stripSiteSuffix_(title, url) {
+  if (!title) return title;
+  if (/hardwax\.com/i.test(url)) {
+    title = title.replace(/\s[-–—]\s*Hard\s*Wax.*$/i, '').trim();
+    title = title.replace(/\s[-–—]\s*Hardwax.*$/i, '').trim();
+  } else if (/clone\.nl/i.test(url) || /clonedistribution\.com/i.test(url)) {
+    title = title.replace(/\s[|]\s*Clone.*$/i, '').trim();
+    title = title.replace(/\s[-–—]\s*Clone.*$/i, '').trim();
+  }
+  return title.replace(/\s{2,}/g, ' ').trim();
+}
+
+/***** DATE & PRICE *****/
+function extractReleaseDate_(text) {
+  if (!text) return '';
+  // 1) yyyy-mm-dd
+  let m = text.match(/\b(20\d{2})-(0?[1-9]|1[0-2])-(0?[1-9]|[12]\d|3[01])\b/);
+  if (m) return `${m[1]}-${pad2_(m[2])}-${pad2_(m[3])}`;
+
+  // 2) d/m/yyyy / d-m-yyyy / d.m.yyyy (also yy)
+  m = text.match(/\b(0?[1-9]|[12]\d|3[01])[\/\-.](0?[1-9]|1[0-2])[\/\-.](\d{2,4})\b/);
+  if (m) {
+    const y = m[3].length === 2 ? `20${m[3]}` : m[3];
+    return `${y}-${pad2_(m[2])}-${pad2_(m[1])}`;
+  }
+
+  // 3) 30 Nov 2025 / Nov 30, 2025 (incl. Italian)
+  const months = { jan:1,feb:2,mar:3,apr:4,may:5,jun:6,jul:7,aug:8,sep:9,oct:10,nov:11,dec:12,
+    gennaio:1,febbraio:2,marzo:3,aprile:4,maggio:5,giugno:6,luglio:7,agosto:8,settembre:9,ottobre:10,novembre:11,dicembre:12 };
+  m = text.match(/\b(0?[1-9]|[12]\d|3[01])\s+([A-Za-zÀ-ÿ]{3,})\.?,?\s+(\d{4})\b/);
+  if (m) { const d = pad2_(m[1]); const mon = normalizeMonth_(m[2], months); if (mon) return `${m[3]}-${pad2_(mon)}-${d}`; }
+  m = text.match(/\b([A-Za-zÀ-ÿ]{3,})\.?\s+(0?[1-9]|[12]\d|3[01]),?\s+(\d{4})\b/);
+  if (m) { const d = pad2_(m[2]); const mon = normalizeMonth_(m[1], months); if (mon) return `${m[3]}-${pad2_(mon)}-${d}`; }
+
+  // 4) Triggered phrases
+  m = text.match(/(?:release\s*date|out\s*on|coming|ships|shipping|pre[-\s]?order|preorder|available)\D{0,20}((?:\d{4}-\d{1,2}-\d{1,2})|(?:\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4})|(?:\d{1,2}\s+[A-Za-zÀ-ÿ]{3,}\s+\d{4})|(?:[A-Za-zÀ-ÿ]{3,}\s+\d{1,2},?\s+\d{4}))/i);
+  if (m) return extractReleaseDate_(m[1]);
+
+  return '';
+}
+
+function extractPrice_(text) {
+  if (!text) return '';
+  const patterns = [
+    /\b(?:EUR|EURO)\s*\d{1,4}(?:[.,]\d{2})?\b/i,
+    /\b(?:USD)\s*\d{1,4}(?:[.,]\d{2})?\b/i,
+    /\b(?:GBP)\s*\d{1,4}(?:[.,]\d{2})?\b/i,
+    /€\s*\d{1,4}(?:[.,]\d{2})?/,
+    /£\s*\d{1,4}(?:[.,]\d{2})?/,
+    /\$\s*\d{1,4}(?:[.,]\d{2})?/,
+    /\b\d{1,4}(?:[.,]\d{2})?\s*(?:EUR|EURO|USD|GBP)\b/i,
+    /\b\d{1,4}(?:[.,]\d{2})?\s*(?:€|£|\$)/
+  ];
+  for (const rx of patterns) { const m = text.match(rx); if (m) return m[0].replace(/\s{2,}/g, ' ').trim(); }
+  const m2 = text.match(/(?:itemprop|data-)?price["':\s=><]+([0-9]+(?:[.,][0-9]{2})?)/i);
+  if (m2) return m2[1];
+  return '';
+}
+
+function parsePriceNumber_(str) {
+  if (!str) return 0;
+  const s = String(str).replace(/[^\d.,]/g, '');
+  if (!s) return 0;
+  const lastComma = s.lastIndexOf(',');
+  const lastDot   = s.lastIndexOf('.');
+  if (lastComma > lastDot) return parseFloat(s.replace(/\./g, '').replace(',', '.')) || 0;
+  return parseFloat(s.replace(/,/g, '')) || 0;
+}
+
+/***** DESTINATION SPREADSHEET (first-run picker) *****/
+function getTargetSpreadsheet_(interactive = true) {
+  const userProps = PropertiesService.getUserProperties();
+  let id = userProps.getProperty(USERPROP_SPREADSHEET_ID);
+
+  if (!id) {
+    if (interactive) {
+      try {
+        const ui = SpreadsheetApp.getUi();
+        const prompt = ui.prompt(
+          'Choose destination spreadsheet',
+          'Paste a Google Sheets link or ID to use as destination.\n' +
+          'Leave empty to use THIS spreadsheet (if any).',
+          ui.ButtonSet.OK_CANCEL
+        );
+        if (prompt.getSelectedButton() === ui.Button.OK) {
+          const input = (prompt.getResponseText() || '').trim();
+          if (input) {
+            const parsed = parseSpreadsheetIdFromInput_(input);
+            if (parsed) id = parsed;
+          }
+        }
+        if (!id) {
+          // fallback to the container-bound sheet if available
+          try { id = SpreadsheetApp.getActiveSpreadsheet().getId(); } catch (e) {}
+        }
+        if (!id) {
+          throw new Error('No destination selected. Please run "Releases → Choose destination…" from the spreadsheet UI.');
+        }
+        userProps.setProperty(USERPROP_SPREADSHEET_ID, id);
+        try {
+          const chosen = SpreadsheetApp.openById(id);
+          ui.alert('Destination set to: “‘' + chosen.getName() + '”');
+        } catch (e) {
+          ui.alert('Saved destination, but failed to open it now. Make sure the ID is correct. Error: ' + e);
+        }
+      } catch (e) {
+        // Likely running from a trigger (no UI). Try to default to active spreadsheet if any.
+        try {
+          id = SpreadsheetApp.getActiveSpreadsheet().getId();
+          userProps.setProperty(USERPROP_SPREADSHEET_ID, id);
+        } catch (err) {
+          throw new Error('No destination spreadsheet configured and no UI available. Open the script from a spreadsheet and run "Releases → Setup (first-time)" or "Choose destination…".');
+        }
+      }
+    } else {
+      // non-interactive call (e.g., trigger). Try to fallback to active container.
+      try {
+        id = SpreadsheetApp.getActiveSpreadsheet().getId();
+        userProps.setProperty(USERPROP_SPREADSHEET_ID, id);
+      } catch (e) {
+        throw new Error('No destination spreadsheet configured. Run "Releases → Choose destination…" once from the spreadsheet UI.');
+      }
+    }
+  }
+
+  return SpreadsheetApp.openById(id);
+}
+
+function parseSpreadsheetIdFromInput_(input) {
+  const s = String(input).trim();
+  // matches /d/<id>/
+  let m = s.match(/\/d\/([a-zA-Z0-9-_]+)/);
+  if (m && m[1]) return m[1];
+  // matches ?id=<id>
+  m = s.match(/[?&]id=([a-zA-Z0-9-_]+)/);
+  if (m && m[1]) return m[1];
+  // plain ID?
+  m = s.match(/^[a-zA-Z0-9\-_]{25,}$/);
+  if (m) return s;
+  return '';
+}
+
+function promptForDestination_() {
+  const ui = SpreadsheetApp.getUi();
+  const userProps = PropertiesService.getUserProperties();
+  const current = userProps.getProperty(USERPROP_SPREADSHEET_ID) || '';
+  const msg = 'Paste a Google Sheets link or ID.\n' +
+              (current ? ('Current: ' + current + '\n') : '') +
+              'Leave empty to use THIS spreadsheet.';
+  const r = ui.prompt('Choose destination spreadsheet', msg, ui.ButtonSet.OK_CANCEL);
+  if (r.getSelectedButton() !== ui.Button.OK) return;
+
+  let input = (r.getResponseText() || '').trim();
+  let id = '';
+  if (input) id = parseSpreadsheetIdFromInput_(input);
+  if (!id) {
+    try { id = SpreadsheetApp.getActiveSpreadsheet().getId(); } catch (e) {}
+  }
+  if (!id) { ui.alert('Could not determine a spreadsheet ID. Please try again.'); return; }
+  userProps.setProperty(USERPROP_SPREADSHEET_ID, id);
+  const ss = SpreadsheetApp.openById(id);
+  ui.alert(`Destination set to: “${ss.getName()}”.`);
+}
+
+/***** SHEET HELPERS *****/
+function getOrCreateSheet_(name, interactive = true) {
+  const ss = getTargetSpreadsheet_(interactive);
+  let sheet = ss.getSheetByName(name);
+  if (!sheet) sheet = ss.insertSheet(name);
+  ensureHeaderWithLinks_(sheet, MIN_LINK_COLS);
+  return sheet;
+}
+
+function ensureHeaderWithLinks_(sheet, linkCols) {
+  linkCols = Math.max(MIN_LINK_COLS, Math.min(MAX_LINK_COLS, linkCols || MIN_LINK_COLS));
+  const header = ['Title'];
+  for (let i = 1; i <= linkCols; i++) header.push(`Link ${i}`);
+  // No From/Subject. Add Qty & Confirmed, and forecast columns, and rightmost "Preso".
+  header.push('Release Date', 'Price', 'Qty', 'Confirmed', 'Email Date', 'Shipping Date', 'Amount', 'Preso');
+  ensureMinColumns_(sheet, header.length);
+  sheet.getRange(1, 1, 1, header.length).setValues([header]);
+  sheet.setFrozenRows(1);
+  sheet.autoResizeColumns(1, header.length);
+}
+
+function ensureMinColumns_(sheet, n) {
+  const maxCols = sheet.getMaxColumns();
+  if (maxCols < n) {
+    const toAdd = n - maxCols;
+    if (maxCols <= 0) sheet.insertColumns(1, toAdd);
+    else sheet.insertColumnsAfter(maxCols, toAdd);
+  }
+}
+
+function readAndNormalizeExistingRows_(sheet) {
+  const lastRow = sheet.getLastRow();
+  const lastCol = sheet.getLastColumn();
+  if (lastRow < 2 || lastCol < 1) return { rows: [], maxLinks: 0 };
+
+  const header = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+  const rdIdx = header.indexOf('Release Date');
+  const priceIdx = header.indexOf('Price');
+  const qtyIdx = header.indexOf('Qty');
+  const confIdx = header.indexOf('Confirmed');
+  const emailIdx = header.indexOf('Email Date');
+
+  const firstLinkCol = 2;
+  const lastLinkCol = (rdIdx > -1 ? rdIdx : Math.max(2, lastCol)) - 1;
+
+  const raw = sheet.getRange(2, 1, lastRow - 1, lastCol).getValues();
+  let maxLinks = 0;
+
+  const isoRx = /^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}$/;
+
+  const parsed = raw.map(row => {
+    const title = finalizeTitle_(String(row[0] || '').trim());
+    const urls = row.slice(firstLinkCol - 1, lastLinkCol).filter(Boolean).map(String);
+
+    let emailDate = '';
+    if (emailIdx > -1) emailDate = String(row[emailIdx] || '').trim();
+    if (!emailDate) {
+      for (let i = 1; i < row.length; i++) {
+        const cell = String(row[i] || '').trim();
+        if (isoRx.test(cell)) { emailDate = cell; break; }
+      }
+    }
+
+    const joined = row.map(c => String(c || '')).join('  ');
+    let releaseDate = (rdIdx > -1) ? String(row[rdIdx] || '').trim() : extractReleaseDate_(joined);
+    if (!releaseDate) releaseDate = extractReleaseDate_(joined);
+    const price = (priceIdx > -1) ? String(row[priceIdx] || '').trim() : extractPrice_(joined);
+
+    const qty = (qtyIdx > -1) ? (parseInt(row[qtyIdx], 10) || 0) : 0;
+    const confirmed = (confIdx > -1) ? String(row[confIdx] || '').trim() : '';
+
+    maxLinks = Math.max(maxLinks, urls.length);
+    return { title, urls, releaseDate, price, qty, confirmed, emailDate };
+  });
+
+  return { rows: parsed, maxLinks };
+}
+
+function shapeRow_(r, linkCols) {
+  const preso = (String(r.confirmed || '').toLowerCase().startsWith('y') &&
+                 (parseInt(r.qty,10) > 0 || isNaN(parseInt(r.qty,10)))) ? 'x' : '';
+  return [
+    r.title || '',
+    ...padRight_((r.urls || []).slice(0, linkCols), linkCols, ''),
+    r.releaseDate || '',
+    r.price || '',
+    r.qty || 0,
+    r.confirmed || '',
+    r.emailDate || '',
+    '', // Shipping Date (computed later)
+    '', // Amount (computed later)
+    preso // Preso (rightmost)
+  ];
+}
+
+/***** TITLE CLEANUP *****/
+function finalizeTitle_(t) {
+  if (!t) return '';
+  return t
+    .replace(/^(Re:|Fwd:)\s*/i, '')
+    .replace(/^[>*\s]+/, '')
+    .replace(/\*+/g, '')
+    .replace(/\s{2,}/g, ' ')
+    .replace(/\s[-–—]\s?(OUT NOW|OUT THIS WEEK|PRE[-\s]?ORDER).*$/i, '')
+    .replace(/\s?https?:\/\/.*$/i, '')
+    .trim();
+}
+
+/***** “ME” DETECTION *****/
+function getMyAddresses_() {
+  const set = new Set();
+  try {
+    const me = Session.getActiveUser().getEmail();
+    if (me) set.add(me.toLowerCase());
+  } catch (e) {}
+  try {
+    (GmailApp.getAliases() || []).forEach(a => set.add(String(a).toLowerCase()));
+  } catch (e) {}
+  return set;
+}
+
+function isFromMe_(msg, myAddrs) {
+  const from = (msg.getFrom() || '').toLowerCase();
+  const m = from.match(/<([^>]+)>/);
+  const email = (m ? m[1] : from).trim();
+  return myAddrs.has(email);
+}
+
+/***** MENU & TRIGGERS *****/
+function onOpen() {
+  // On first open (per account), prompt for destination if not set
+  try { getTargetSpreadsheet_(true); } catch (e) { /* ignore in case of no UI */ }
+
+  SpreadsheetApp.getUi()
+    .createMenu('Releases')
+    .addItem('Run scan now', 'scanLabelAndUpdateSheet')
+    .addItem('Re-scan all (ignore history)', 'rescanAll_')
+    .addItem('Choose destination…', 'promptForDestination_')
+    .addSeparator()
+    .addItem('Setup (first-time)', 'firstTimeSetup_')
+    .addToUi();
+}
+
+function rescanAll_(){
+  const props = PropertiesService.getScriptProperties();
+  props.deleteProperty('PROCESSED_MSG_IDS');
+  scanLabelAndUpdateSheet();
+}
+
+function firstTimeSetup_() {
+  // Force destination selection on first setup
+  promptForDestination_();
+  const sheet = getOrCreateSheet_(SHEET_NAME, true);
+  createDailyTrigger_();
+  SpreadsheetApp.getUi().alert(`Setup complete:
+• Label: ${LABEL}
+• Spreadsheet: ${(sheet.getParent() || SpreadsheetApp.getActiveSpreadsheet()).getName()}
+• Sheet tab: ${SHEEP_NAME}
+• Daily run: ${RUN_EVERY_DAY_AT_HOUR}:00`);
+}
+
+function createDailyTrigger_() {
+  // Remove existing triggers for a clean slate
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === 'scanLabelAndUpdateSheet') ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger('scanLabelAndUpdateSheet')
+    .timeBased()
+    .everyDays(1)
+    .atHour(RUN_EVERY_DAY_AT_HOUR)
+    .create();
+}
+
+/***** UTIL *****/
+function toIsoLocal_(d) {
+  try { return Utilities.formatDate(d, Session.getScriptTimeZone(), "yyyy-MM-dd' 'HH:mm"); }
+  catch (e) { return ''; }
+}
+function toIsoDate_(d) {
+  try { return Utilities.formatDate(d, Session.getScriptTimeZone(), "yyyy-MM-dd"); }
+  catch (e) { return ''; }
+}
+function padRight_(arr, len, fill='') {
+  const out = arr.slice(); while (out.length < len) out.push(fill); return out;
+}
+function pad2_(n) { n = String(n); return n.length === 1 ? '0' + n : n; }
+function normalizeMonth_(s, map) {
+  const k = s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+  const short = k.slice(0,3);
+  return map[k] || map[short] || null;
+}
+function parseDate_(s) { const d = new Date(s); return isNaN(d.getTime()) ? null : d; }
