@@ -10,10 +10,7 @@ This README walks you through setting up the Apps Script that reads your **Gmail
 * A Gmail **label** that contains all Ultrasuoni emails.
 * A Google **Sheets** file where results will be written.
 
-> In the ZIP you received, there are two files:
->
-> * `code.txt` → the Apps Script source you’ll paste.
-> * `README.txt` → these instructions.
+`code` → the Apps Script source you’ll paste
 
 ---
 
